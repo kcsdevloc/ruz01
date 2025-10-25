@@ -1,0 +1,41 @@
+name: ruz-test
+on:
+  workflow_dispatch:
+    inputs:
+      years:       { description: "Years",       required: true,  default: "5",  type: string }
+      rps:         { description: "Global RPS",  required: true,  default: "10", type: string }
+      rotate_mb:   { description: "Rotate MB",   required: true,  default: "32", type: string }
+      concurrency: { description: "Threads",     required: true,  default: "32", type: string }
+
+jobs:
+  run-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install requests zstandard
+      - name: Run tiny batch (≈10 UJs)
+        env:
+          YEARS:       ${{ inputs.years }}
+          RPS:         ${{ inputs.rps }}
+          ROTATE_MB:   ${{ inputs.rotate_mb }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+        run: |
+          mkdir -p out
+          python ruz_bulk_local.py \
+            --years "$YEARS" \
+            --base-dir out \
+            --concurrency "$CONCURRENCY" \
+            --rps "$RPS" \
+            --report-every 30 \
+            --rotate-mb "$ROTATE_MB" \
+            --max-uj 10 \
+            --shard 0 --of 1
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Keep the same name pattern your runner expects:
+          name: ruz-shard-0
+          path: out/**
+          retention-days: 3
