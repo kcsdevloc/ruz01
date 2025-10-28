@@ -237,17 +237,17 @@ def year_from(st: dict) -> Optional[int]:
 
 
 def select_statements(statements: List[dict], last_n_years: int) -> List[dict]:
-    """Non-consolidated; best per year (prefer typ == 'Riadna'); last N years by okres-do year."""
-    # Filter indiv
-    indiv = [s for s in statements if not s.get("konsolidovana", False)]
-    # group by year
+    """
+    Best per year (prefer typ == 'Riadna'), regardless of 'konsolidovana'.
+    Then take the last N years by 'obdobieDo' year.
+    """
     bucket: Dict[int, List[dict]] = {}
-    for s in indiv:
+    for s in statements or []:
         y = year_from(s)
         if y is None:
             continue
         bucket.setdefault(y, []).append(s)
-    # pick best per year
+
     chosen = []
     for y, items in bucket.items():
         items_sorted = sorted(
@@ -259,9 +259,9 @@ def select_statements(statements: List[dict], last_n_years: int) -> List[dict]:
             ),
         )
         chosen.append(items_sorted[0])
-    # last N years only
-    chosen_sorted = sorted(chosen, key=lambda s: year_from(s) or 0, reverse=True)
-    return chosen_sorted[:last_n_years]
+
+    chosen_sorted = sorted(chosen, key=lambda s: year_from(s) or -1, reverse=True)
+    return chosen_sorted[:max(0, int(last_n_years))]
 
 
 def worker(
@@ -303,6 +303,11 @@ def worker(
                     # continue to next statement
                     continue
 
+            # DEBUG: count how many statements were fetched for this UJ
+            # (uncomment temporarily if you want to sample)
+            # if (uj_id % 50000) == 0:
+            #     print(f"[DEBUG] uj_id={uj_id} st_ids={len(st_ids)} fetched={len(statements)}", flush=True)
+
             selected = select_statements(statements, years)
 
             for st in selected:
@@ -317,7 +322,13 @@ def worker(
                         try:
                             rep = get_report_detail(session, limiter, rep_id)
                             if allow_report(rep):
-                                w_rep.write_obj({"type": "report", "uj_id": uj_id, "ico": ico, "statement_id": st.get("id"), "payload": rep})
+                                w_rep.write_obj({
+                                    "type": "report",
+                                    "uj_id": uj_id,
+                                    "ico": ico,
+                                    "statement_id": st.get("id"),
+                                    "payload": rep
+                                })
                                 with counters_lock:
                                     counters["rept_done"] += 1
                         except Exception:
