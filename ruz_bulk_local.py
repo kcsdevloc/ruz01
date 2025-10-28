@@ -13,7 +13,6 @@ Features
 
 Usage (example):
   python ruz_bulk_local.py --years 5 --base-dir "m:\\pg_ts\\api\\raw\\ruz_bulk" --concurrency 64 --rps 60
-
 """
 
 import argparse
@@ -64,7 +63,6 @@ start_time = time.time()
 q_uj_global = None            # set in main() after queue is created
 worker_count_global = 0       # set in main() after workers are started
 session_global = None         # set in main() after session is created
-
 
 
 # ---------------- Token-bucket limiter ----------------
@@ -274,6 +272,8 @@ def worker(
     w_uj: NDJSONWriter,
     w_stmt: NDJSONWriter,
     w_rep: NDJSONWriter,
+    allow_statement,          # callable(payload)->bool
+    allow_report,             # callable(payload)->bool
 ):
     while not stop_event.is_set():
         try:
@@ -306,22 +306,24 @@ def worker(
             selected = select_statements(statements, years)
 
             for st in selected:
-                w_stmt.write_obj({"type": "statement", "uj_id": uj_id, "ico": ico, "payload": st})
-                with counters_lock:
-                    counters["stmt_done"] += 1
-                rep_ids = st.get("idUctovnychVykazov") or []
-                for rep_id in rep_ids:
-                    if stop_event.is_set():
-                        break
-                    try:
-                        rep = get_report_detail(session, limiter, rep_id)
-                        w_rep.write_obj({"type": "report", "uj_id": uj_id, "ico": ico, "statement_id": st.get("id"), "payload": rep})
-                        with counters_lock:
-                            counters["rept_done"] += 1
-                    except Exception:
-                        with counters_lock:
-                            counters["req_err"] += 1
-                        continue
+                if allow_statement(st):
+                    w_stmt.write_obj({"type": "statement", "uj_id": uj_id, "ico": ico, "payload": st})
+                    with counters_lock:
+                        counters["stmt_done"] += 1
+                    rep_ids = st.get("idUctovnychVykazov") or []
+                    for rep_id in rep_ids:
+                        if stop_event.is_set():
+                            break
+                        try:
+                            rep = get_report_detail(session, limiter, rep_id)
+                            if allow_report(rep):
+                                w_rep.write_obj({"type": "report", "uj_id": uj_id, "ico": ico, "statement_id": st.get("id"), "payload": rep})
+                                with counters_lock:
+                                    counters["rept_done"] += 1
+                        except Exception:
+                            with counters_lock:
+                                counters["req_err"] += 1
+                            continue
 
             with counters_lock:
                 counters["uj_done"] += 1
@@ -433,6 +435,11 @@ def main():
     parser.add_argument("--max-uj", type=int, default=0, help="Process at most this many UJs (0 = no limit).")
     parser.add_argument("--shard", type=int, default=0, help="0-based shard id (this worker)")
     parser.add_argument("--of", type=int, default=1, help="total number of shards")
+    # NEW: inclusive year window for statements/reports (defaults from env MIN_YEAR/MAX_YEAR if present)
+    parser.add_argument("--min-year", type=int, default=(int(os.getenv("MIN_YEAR")) if os.getenv("MIN_YEAR") else None),
+                        help="inclusive lower bound year for statements/reports")
+    parser.add_argument("--max-year", type=int, default=(int(os.getenv("MAX_YEAR")) if os.getenv("MAX_YEAR") else None),
+                        help="inclusive upper bound year for statements/reports")
     args = parser.parse_args()
     if args.of <= 0 or not (0 <= args.shard < args.of):
         print(f"--shard must be in [0..{args.of-1}] and --of > 0", file=sys.stderr)
@@ -449,9 +456,8 @@ def main():
     global session_global
     session_global = session
 
-
     # Writers (chunked)
-    w_uj   = NDJSONWriter(args.base_dir, "uj",   rotate_mb=args.rotate_mb, codec=args.codec)
+    w_uj   = NDJSONWriter(args.base_dir, "uj",        rotate_mb=args.rotate_mb, codec=args.codec)
     w_stmt = NDJSONWriter(args.base_dir, "statement", rotate_mb=args.rotate_mb, codec=args.codec)
     w_rep  = NDJSONWriter(args.base_dir, "report",    rotate_mb=args.rotate_mb, codec=args.codec)
 
@@ -462,18 +468,51 @@ def main():
     threading.Thread(target=reporter, args=(args.report_every,), daemon=True).start()
     threading.Thread(target=key_listener, daemon=True).start()
 
+    # Year-window predicates (gate writes)
+    def allow_statement(payload: dict) -> bool:
+        if args.min_year is None and args.max_year is None:
+            return True
+        y = year_from(payload or {})
+        if y is None:
+            return False
+        if args.min_year is not None and y < args.min_year:
+            return False
+        if args.max_year is not None and y > args.max_year:
+            return False
+        return True
+
+    def allow_report(payload: dict) -> bool:
+        if args.min_year is None and args.max_year is None:
+            return True
+        ts = ((payload or {}).get("obsah") or {}).get("titulnaStrana") or {}
+        d = ts.get("obdobieDo")
+        try:
+            y = int(str(d).split("-")[0]) if d else None
+        except Exception:
+            y = None
+        if y is None:
+            return False
+        if args.min_year is not None and y < args.min_year:
+            return False
+        if args.max_year is not None and y > args.max_year:
+            return False
+        return True
+
     # Workers
     workers: List[threading.Thread] = []
     for _ in range(args.concurrency):
-        t = threading.Thread(target=worker, args=(session, limiter, q_uj, args.years, w_uj, w_stmt, w_rep), daemon=True)
+        t = threading.Thread(
+            target=worker,
+            args=(session, limiter, q_uj, args.years, w_uj, w_stmt, w_rep, allow_statement, allow_report),
+            daemon=True
+        )
         t.start()
         workers.append(t)
-        
+
     # expose queue and worker count to the signal handler
     global q_uj_global, worker_count_global
     q_uj_global = q_uj
     worker_count_global = len(workers)
-
 
     # Enumerate UJs and enqueue
     try:
@@ -527,7 +566,6 @@ def main():
                 break
             time.sleep(0.1)
 
-
         # Close writers
         try:
             w_uj.close()
@@ -539,14 +577,12 @@ def main():
         # Wait workers (briefly)
         for t in workers:
             t.join(timeout=1.0)
-            
+
         # Close session on clean exit too (harmless if already closed by Ctrl+C)
         try:
             session.close()
         except Exception:
             pass
-
-
 
     # Final line
     with counters_lock:
