@@ -3,22 +3,19 @@ name: ruz-bulk
 on:
   workflow_dispatch:
     inputs:
-      # existing knobs
-      years:        { description: "Years (kept for compatibility)", required: true,  default: "5",   type: string }
-      rps:          { description: "Global RPS",                     required: true,  default: "10",  type: string }
-      shard:        { description: "Shard id",                       required: true,  default: "1",   type: string }
-      of:           { description: "Total shards",                   required: true,  default: "16",  type: string }
-      rotate_mb:    { description: "Rotate MB",                      required: true,  default: "128", type: string }
-      concurrency:  { description: "Threads",                        required: true,  default: "64",  type: string }
-
-      # NEW: explicit year window (inclusive). If set, artifacts will contain only these years.
-      min_year:     { description: "Min year (inclusive)",           required: false, default: "1995", type: string }
-      max_year:     { description: "Max year (inclusive)",           required: false, default: "2012", type: string }
+      years:        { description: "Years",        required: true,  default: "5",   type: string }
+      rps:          { description: "Global RPS",   required: true,  default: "10",  type: string }
+      shard:        { description: "Shard id",     required: true,  default: "1",   type: string }
+      of:           { description: "Total shards", required: true,  default: "16",  type: string }
+      rotate_mb:    { description: "Rotate MB",    required: true,  default: "128", type: string }
+      concurrency:  { description: "Threads",      required: true,  default: "64",  type: string }
+      min_year:     { description: "Min year (inclusive)", required: false, default: "1995", type: string }
+      max_year:     { description: "Max year (inclusive)", required: false, default: "2012", type: string }
 
 jobs:
   run-shard:
     runs-on: ubuntu-latest
-    timeout-minutes: 300  # hard cap: 5 hours
+    timeout-minutes: 300
 
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +29,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests zstandard
 
-      - name: Run shard (soft stop before 5h)
+      - name: Run shard
         env:
           YEARS:        ${{ inputs.years }}
           RPS:          ${{ inputs.rps }}
@@ -45,7 +42,6 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           mkdir -p out
-          # 4h55m = 17,700 seconds; soft-limit so upload still happens.
           timeout --signal=INT --kill-after=30s 17700s \
           python ruz_bulk_local.py \
             --years "$YEARS" \
@@ -58,102 +54,10 @@ jobs:
             --min-year "$MIN_YEAR" --max-year "$MAX_YEAR" \
           || true
 
-      # If ruz_bulk_local.py doesn’t (yet) honor --min-year/--max-year, we still
-      # enforce the window by filtering the produced files before upload.
-      - name: Filter artifact by year window
-        env:
-          MIN_YEAR: ${{ inputs.min_year }}
-          MAX_YEAR: ${{ inputs.max_year }}
-        run: |
-          python - <<'PY'
-import os, io, json, gzip, sys, shutil
-from pathlib import Path
-try:
-  import zstandard as zstd
-  HAS_ZSTD=True
-except Exception:
-  HAS_ZSTD=False
-
-def open_in(p: Path):
-  raw=open(p,'rb')
-  n=p.name.lower()
-  if n.endswith('.zst'):
-    if not HAS_ZSTD: sys.exit("zstandard required on runner")
-    d=zstd.ZstdDecompressor()
-    return io.TextIOWrapper(d.stream_reader(raw),encoding='utf-8',newline='')
-  if n.endswith('.gz'):
-    return io.TextIOWrapper(gzip.GzipFile(fileobj=raw,mode='rb'),encoding='utf-8',newline='')
-  return io.TextIOWrapper(raw,encoding='utf-8',newline='')
-
-def open_out(p: Path):
-  p.parent.mkdir(parents=True,exist_ok=True)
-  n=p.name.lower()
-  if n.endswith('.zst'):
-    if not HAS_ZSTD: sys.exit("zstandard required on runner")
-    c=zstd.ZstdCompressor(level=10, write_content_size=False)
-    return io.BufferedWriter(c.stream_writer(open(p,'wb')))
-  if n.endswith('.gz'):
-    return gzip.GzipFile(fileobj=open(p,'wb'),mode='wb',compresslevel=6)
-  return open(p,'wb')
-
-def y_from_date(d):
-  if not d: return None
-  try: return int(str(d).split('-')[0])
-  except: return None
-
-MIN_Y=int(os.getenv('MIN_YEAR') or '1995')
-MAX_Y=int(os.getenv('MAX_YEAR') or '2012')
-src=Path('out'); dst=Path('out_filtered')
-if dst.exists(): shutil.rmtree(dst)
-dst.mkdir(parents=True,exist_ok=True)
-
-def keep_statement(rec):
-  if rec.get('type')!='statement': return False
-  y=y_from_date((rec.get('payload') or {}).get('obdobieDo'))
-  return y is not None and MIN_Y<=y<=MAX_Y
-
-def keep_report(rec):
-  if rec.get('type')!='report': return False
-  ts=(rec.get('payload') or {}).get('obsah') or {}
-  ts=(ts.get('titulnaStrana') or {})
-  y=y_from_date(ts.get('obdobieDo'))
-  return y is not None and MIN_Y<=y<=MAX_Y
-
-def process(typ):
-  parts=list((src/typ).glob('part-*.ndjson.*'))
-  if not parts: return
-  (dst/typ).mkdir(parents=True,exist_ok=True)
-  kept=0; total=0
-  for p in parts:
-    outp=dst/typ/p.name
-    w=open_out(outp)
-    with open_in(p) as fh:
-      for line in fh:
-        total+=1
-        line=line.strip()
-        if not line: continue
-        try: rec=json.loads(line)
-        except Exception: continue
-        if typ=='statement':
-          if not keep_statement(rec): continue
-        elif typ=='report':
-          if not keep_report(rec): continue
-        else:
-          # skip UJ to keep artifacts small during backfill
-          continue
-        w.write((json.dumps(rec, ensure_ascii=False)+'\n').encode('utf-8'))
-        kept+=1
-    w.close()
-  print(f"{typ}: kept {kept} of {total}")
-
-process('statement')
-process('report')
-PY
-
-      - name: Upload artifact (filtered to year window)
+      - name: Upload artifact (this shard)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ruz-shard-${{ inputs.shard }}
-          path: out_filtered/**
+          path: out/**
           retention-days: 5
