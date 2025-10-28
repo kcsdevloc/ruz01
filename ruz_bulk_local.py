@@ -54,8 +54,11 @@ counters = {
     "rept_done": 0,
     "req_ok": 0,
     "req_err": 0,
-    "rps_window": 0,  # incremented per OK/ERR; reset by reporter to compute RPS
+    "rps_window": 0,          # incremented per OK/ERR; reset by reporter to compute RPS
+    "stmt_fetch_failed_uj": 0, # UJs that had statement IDs but we ended up fetching none
+    "err_by_status": {},       # e.g. {"429": 1234, "403": 55, "bad_json": 7, "exc": 2}
 }
+
 
 start_time = time.time()
 
@@ -103,9 +106,15 @@ def setup_session(timeout: int) -> requests.Session:
     adapter = HTTPAdapter(max_retries=retries, pool_connections=256, pool_maxsize=256)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
-    s.headers.update({"Accept": "application/json"})
+    # Custom UA helps with servers that dislike the default requests UA
+    s.headers.update({
+        "Accept": "application/json",
+        "User-Agent": "ruz-bulk/1.0 (+https://registeruz.sk collector)",
+        "Accept-Language": "en",
+    })
     s.request_timeout = timeout
     return s
+
 
 
 def GET(session: requests.Session, limiter: TokenBucket, path: str, params: Optional[dict] = None) -> dict:
@@ -123,6 +132,10 @@ def GET(session: requests.Session, limiter: TokenBucket, path: str, params: Opti
             with counters_lock:
                 counters["req_err"] += 1
                 counters["rps_window"] += 1
+                code = str(resp.status_code)
+                eb = counters.get("err_by_status") or {}
+                eb[code] = eb.get(code, 0) + 1
+                counters["err_by_status"] = eb
             # raise with context (trim body)
             raise RuntimeError(f"HTTP {resp.status_code} {url} params={params} body={resp.text[:300]}")
         try:
@@ -131,6 +144,9 @@ def GET(session: requests.Session, limiter: TokenBucket, path: str, params: Opti
             with counters_lock:
                 counters["req_err"] += 1
                 counters["rps_window"] += 1
+                eb = counters.get("err_by_status") or {}
+                eb["bad_json"] = eb.get("bad_json", 0) + 1
+                counters["err_by_status"] = eb
             raise RuntimeError(f"Bad JSON {url} params={params}: {e} body={resp.text[:300]}")
         with counters_lock:
             counters["req_ok"] += 1
@@ -139,7 +155,12 @@ def GET(session: requests.Session, limiter: TokenBucket, path: str, params: Opti
     except Exception:
         # brief jittered sleep to smooth spikes
         time.sleep(0.1 + 0.2 * (time.time() % 1))
+        with counters_lock:
+            eb = counters.get("err_by_status") or {}
+            eb["exc"] = eb.get("exc", 0) + 1
+            counters["err_by_status"] = eb
         raise
+
 
 
 # ---------------- Chunked NDJSON writers ----------------
@@ -308,7 +329,12 @@ def worker(
             # if (uj_id % 50000) == 0:
             #     print(f"[DEBUG] uj_id={uj_id} st_ids={len(st_ids)} fetched={len(statements)}", flush=True)
 
+            if st_ids and not statements:
+                with counters_lock:
+                    counters["stmt_fetch_failed_uj"] += 1
+
             selected = select_statements(statements, years)
+
 
             for st in selected:
                 if allow_statement(st):
@@ -359,6 +385,8 @@ def reporter(period_sec: int):
             rps = c["rps_window"] / period_sec
             counters["rps_window"] = 0  # reset for next window
         elapsed = time.time() - start_time
+        eb = c.get("err_by_status") or {}
+        eb_str = ", ".join(f"{k}:{v}" for k, v in sorted(eb.items()))
         msg = (
             f"[{time.strftime('%H:%M:%S')}] "
             f"UJ {c['uj_done']}/{c['uj_enqueued']} | "
@@ -367,7 +395,12 @@ def reporter(period_sec: int):
             f"Req OK {c['req_ok']} / ERR {c['req_err']} | "
             f"RPS {rps:.1f} | Elapsed {int(elapsed/60)}m"
         )
+        if eb_str:
+            msg += f" | ERR by status [{eb_str}]"
+        if c.get("stmt_fetch_failed_uj", 0):
+            msg += f" | UJ no-stmt-fetched {c['stmt_fetch_failed_uj']}"
         print(msg, flush=True)
+
 
 
 def key_listener():
