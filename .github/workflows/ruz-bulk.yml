@@ -1,53 +1,57 @@
-name: ruz-bulk
 on:
   workflow_dispatch:
     inputs:
-      years:       { description: "Years",        required: true,  default: "5",   type: string }
-      rps:         { description: "Global RPS",   required: true,  default: "10",  type: string }
-      shard:       { description: "Shard id",     required: true,  default: "1",   type: string }
-      of:          { description: "Total shards", required: true,  default: "16",  type: string }
-      rotate_mb:   { description: "Rotate MB",    required: true,  default: "128", type: string }
-      concurrency: { description: "Threads",      required: true,  default: "64",  type: string }
+      years:
+        description: "Legacy input; ignored if min_year/max_year are set"
+        required: false
+        default: "30"
+      shard:
+        description: "Shard number"
+        required: true
+      of:
+        description: "Total shards"
+        required: true
+        default: "48"
+      rps:
+        description: "Requests per second"
+        required: false
+        default: "30"
+      rotate_mb:
+        description: "Rotate artifact at ~MB"
+        required: false
+        default: "64"
+      concurrency:
+        description: "Downloader concurrency"
+        required: false
+        default: "64"
+      min_year:
+        description: "Lower bound year (inclusive)"
+        required: false
+        default: ""
+      max_year:
+        description: "Upper bound year (inclusive)"
+        required: false
+        default: ""
 
 jobs:
-  run-shard:
+  ruz-bulk:
     runs-on: ubuntu-latest
-    timeout-minutes: 300   # hard cap: 5 hours
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests zstandard
-      - name: Run shard (soft stop before 5h)
+        with: { python-version: '3.11' }
+      - run: pip install -r tools/requirements.txt
+      - name: Run bulk
         env:
-          YEARS:       ${{ inputs.years }}
-          RPS:         ${{ inputs.rps }}
-          SHARD:       ${{ inputs.shard }}
-          OF:          ${{ inputs.of }}
-          ROTATE_MB:   ${{ inputs.rotate_mb }}
-          CONCURRENCY: ${{ inputs.concurrency }}
-          PYTHONUNBUFFERED: "1"
+          SHARD:        ${{ github.event.inputs.shard }}
+          OF:           ${{ github.event.inputs.of }}
+          RPS:          ${{ github.event.inputs.rps }}
+          ROTATE_MB:    ${{ github.event.inputs.rotate_mb }}
+          CONC:         ${{ github.event.inputs.concurrency }}
+          MIN_YEAR:     ${{ github.event.inputs.min_year }}
+          MAX_YEAR:     ${{ github.event.inputs.max_year }}
         run: |
-          mkdir -p out
-          # Soft limit to allow artifact upload even if still working near the hard cap.
-          # 4h55m = 17,700 seconds
-          timeout --signal=INT --kill-after=30s 17700s \
-            python ruz_bulk_local.py \
-              --years "$YEARS" \
-              --base-dir out \
-              --concurrency "$CONCURRENCY" \
-              --rps "$RPS" \
-              --report-every 60 \
-              --rotate-mb "$ROTATE_MB" \
-              --shard "$SHARD" --of "$OF" || true
-      - name: Upload artifact (all types for this shard)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ruz-shard-${{ inputs.shard }}
-          path: out/**
-          retention-days: 5
+          python tools/ruz_bulk_runner.py \
+            --shard "$SHARD" --of "$OF" --rps "$RPS" --concurrency "$CONC" --rotate-mb "$ROTATE_MB" \
+            ${MIN_YEAR:+--min-year "$MIN_YEAR"} \
+            ${MAX_YEAR:+--max-year "$MAX_YEAR"}
